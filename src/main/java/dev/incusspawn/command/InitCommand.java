@@ -243,6 +243,7 @@ public class InitCommand extends BaseCommand {
         if (credentials.contains("claude")) setupClaudeAuth();
         if (credentials.contains("github")) setupGitHubAuth();
         if (credentials.contains("bob")) setupBobAuth();
+        if (credentials.contains("codex")) setupCodexAuth();
         closeHttpClient();
         setupSearchPaths();
         setupHostPaths();
@@ -303,6 +304,7 @@ public class InitCommand extends BaseCommand {
         if (macCredentials.contains("claude")) setupClaudeAuth();
         if (macCredentials.contains("github")) setupGitHubAuth();
         if (macCredentials.contains("bob")) setupBobAuth();
+        if (macCredentials.contains("codex")) setupCodexAuth();
         closeHttpClient();
         setupSearchPaths();
         setupHostPaths();
@@ -854,11 +856,13 @@ public class InitCommand extends BaseCommand {
         var claudeTag = config.getClaude().hasAuth() ? " [configured]" : "";
         var githubTag = !config.getGithub().getToken().isBlank() ? " [configured]" : "";
         var bobTag = config.getBob().hasAuth() ? " [configured]" : "";
+        var codexTag = config.getCodex().hasAuth() ? " [configured]" : "";
 
         System.out.println("  Which credentials do you want to configure?");
         System.out.println("    1. Claude Code — AI coding assistant" + claudeTag);
         System.out.println("    2. GitHub — PAT for git operations" + githubTag);
         System.out.println("    3. Bob Shell — IBM AI coding assistant" + bobTag);
+        System.out.println("    4. Codex — OpenAI coding agent" + codexTag);
         System.out.println();
         System.out.print("  Enter numbers separated by commas, 'all', or press Enter to skip: ");
         var input = console.readLine();
@@ -871,12 +875,14 @@ public class InitCommand extends BaseCommand {
             selected.add("claude");
             selected.add("github");
             selected.add("bob");
+            selected.add("codex");
         } else {
             for (var part : input.split(",")) {
                 switch (part.strip()) {
                     case "1" -> selected.add("claude");
                     case "2" -> selected.add("github");
                     case "3" -> selected.add("bob");
+                    case "4" -> selected.add("codex");
                 }
             }
         }
@@ -1404,6 +1410,78 @@ public class InitCommand extends BaseCommand {
 
         config.save();
         System.out.println("  Bob configuration saved.");
+    }
+
+    private void setupCodexAuth() {
+        startStep("Codex Authentication",
+                "Sets up OpenAI Codex authentication. You can use an API key",
+                "(billed to API credits) or OAuth via your ChatGPT plan.",
+                "With OAuth, run 'codex login' inside a container — the proxy",
+                "captures the real tokens and keeps only placeholders in the",
+                "container.");
+        var config = SpawnConfig.load();
+        var console = System.console();
+        if (console == null) {
+            System.err.println("  Error: no console available for interactive setup.");
+            return;
+        }
+
+        if (config.getCodex().hasAuth()) {
+            if (config.getCodex().isOauthMode()) {
+                System.out.println("  Codex auth: OAuth mode");
+            } else {
+                System.out.println("  Codex auth: API key configured (" + maskSecret(config.getCodex().getApiKey()) + ")");
+            }
+            System.out.print("  Keep current? (Y/n): ");
+            var keep = console.readLine();
+            if (keep == null || !keep.strip().equalsIgnoreCase("n")) {
+                return;
+            }
+        }
+
+        System.out.println("  How do you want to authenticate?");
+        System.out.println("    1. OAuth — uses your ChatGPT Plus/Pro/Max plan");
+        System.out.println("    2. API key — billed to OpenAI API credits");
+        System.out.println();
+        System.out.print("  Choice (1/2, or press Enter to skip): ");
+        var choice = console.readLine();
+        if (choice == null || choice.isBlank()) {
+            System.out.println("  Skipped Codex setup. You can configure it later by re-running 'isx init'.");
+            return;
+        }
+
+        switch (choice.strip()) {
+            case "1" -> {
+                config.getCodex().setOauth(true);
+                config.getCodex().setApiKey("");
+                config.save();
+                System.out.println("  OAuth mode enabled. After building a template with the 'codex' tool,");
+                System.out.println("  run 'codex login' inside a container to authenticate via device code flow.");
+                System.out.println("  The proxy will capture and manage your tokens transparently.");
+            }
+            case "2" -> {
+                System.out.println("  To create an API key:");
+                System.out.println("    1. Go to https://platform.openai.com/api-keys");
+                System.out.println("    2. Create a new secret key");
+                System.out.println("    3. Copy the generated key");
+                System.out.println();
+                System.out.print("  OpenAI API key (or press Enter to skip): ");
+                var passwordChars = console.readPassword();
+                var apiKey = passwordChars != null ? new String(passwordChars) : "";
+                if (apiKey.isBlank()) {
+                    System.out.println("  Skipped Codex setup. You can configure it later by re-running 'isx init'.");
+                    return;
+                }
+                config.getCodex().setApiKey(apiKey);
+                config.getCodex().setOauth(false);
+                config.save();
+            }
+            default -> {
+                System.out.println("  Skipped Codex setup. You can configure it later by re-running 'isx init'.");
+                return;
+            }
+        }
+        System.out.println("  Codex configuration saved.");
     }
 
     private void setupPathList(

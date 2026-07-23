@@ -25,6 +25,7 @@ public class SpawnConfig {
     private ClaudeConfig claude = new ClaudeConfig();
     private GitHubConfig github = new GitHubConfig();
     private BobConfig bob = new BobConfig();
+    private CodexConfig codex = new CodexConfig();
     private java.util.List<String> searchPaths = java.util.List.of();
     @JsonProperty("host-path")
     private String hostPath = "";
@@ -90,12 +91,27 @@ public class SpawnConfig {
         public void setLicenseConsent(boolean licenseConsent) { this.licenseConsent = licenseConsent; }
     }
 
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class CodexConfig {
+        private String apiKey = "";
+        private boolean oauth;
+
+        public String getApiKey() { return apiKey; }
+        public void setApiKey(String apiKey) { this.apiKey = apiKey == null ? "" : apiKey; }
+        public boolean isOauth() { return oauth; }
+        public void setOauth(boolean oauth) { this.oauth = oauth; }
+        public boolean hasAuth() { return oauth || !apiKey.isBlank(); }
+        public boolean isOauthMode() { return oauth; }
+    }
+
     public ClaudeConfig getClaude() { return claude; }
     public void setClaude(ClaudeConfig claude) { this.claude = claude; }
     public GitHubConfig getGithub() { return github; }
     public void setGithub(GitHubConfig github) { this.github = github; }
     public BobConfig getBob() { return bob; }
     public void setBob(BobConfig bob) { this.bob = bob; }
+    public CodexConfig getCodex() { return codex; }
+    public void setCodex(CodexConfig codex) { this.codex = codex; }
     public java.util.List<String> getSearchPaths() { return searchPaths; }
     public void setSearchPaths(java.util.List<String> searchPaths) { this.searchPaths = searchPaths == null ? java.util.List.of() : searchPaths; }
     public String getHostPath() { return hostPath; }
@@ -157,6 +173,11 @@ public class SpawnConfig {
         if (tools.contains("bob")) {
             if (!config.getBob().hasAuth()) {
                 missing.add("Bob API key");
+            }
+        }
+        if (tools.contains("codex")) {
+            if (!config.getCodex().hasAuth()) {
+                missing.add("OpenAI API key or Codex OAuth");
             }
         }
 

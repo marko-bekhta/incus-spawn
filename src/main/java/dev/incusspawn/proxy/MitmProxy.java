@@ -24,7 +24,10 @@ import io.vertx.core.http.HttpVersion;
 import io.vertx.core.http.RequestOptions;
 import io.vertx.core.net.JksOptions;
 
+import dev.incusspawn.tool.CodexSetup;
+
 import java.io.ByteArrayOutputStream;
+import java.util.Base64;
 import java.net.URI;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -79,6 +82,10 @@ public class MitmProxy {
             "plugins.gradle.org"
     );
     private static final Set<String> GRADLE_DOMAINS = Set.of("services.gradle.org");
+    private static final Set<String> OPENAI_API_DOMAINS = Set.of("api.openai.com");
+    private static final String OPENAI_AUTH_DOMAIN = "auth.openai.com";
+    private static final String CHATGPT_BASE_DOMAIN = "chatgpt.com";
+    private static final String CHATGPT_LEGACY_BASE_DOMAIN = "chat.openai.com";
     private static final String BOB_BASE_DOMAIN = "bob.ibm.com";
     // Regional subdomains need explicit entries so the proxy generates wildcard
     // certs at each level (*.us-east.bob.ibm.com, etc.) — a single *.bob.ibm.com
@@ -102,11 +109,18 @@ public class MitmProxy {
         all.addAll(REGISTRY_DOMAINS);
         all.addAll(MAVEN_DOMAINS);
         all.addAll(GRADLE_DOMAINS);
+        all.addAll(OPENAI_API_DOMAINS);
+        all.add(OPENAI_AUTH_DOMAIN);
+        all.add(CHATGPT_BASE_DOMAIN);
+        all.add(CHATGPT_LEGACY_BASE_DOMAIN);
         all.add(BOB_BASE_DOMAIN);
         all.addAll(BOB_REGIONAL_DOMAINS);
         INTERCEPTED_DOMAIN_SET = Set.copyOf(all);
 
-        WILDCARD_DOMAIN_SUFFIXES = List.of("." + BOB_BASE_DOMAIN);
+        WILDCARD_DOMAIN_SUFFIXES = List.of(
+                "." + BOB_BASE_DOMAIN,
+                "." + CHATGPT_BASE_DOMAIN,
+                "." + CHATGPT_LEGACY_BASE_DOMAIN);
     }
 
     private static boolean isInterceptedDomain(String domain) {
@@ -119,6 +133,15 @@ public class MitmProxy {
 
     private static boolean isBobDomain(String domain) {
         return domain.equals(BOB_BASE_DOMAIN) || domain.endsWith("." + BOB_BASE_DOMAIN);
+    }
+
+    private static boolean isCodexChatGptDomain(String domain) {
+        return domain.equals(CHATGPT_BASE_DOMAIN) || domain.endsWith("." + CHATGPT_BASE_DOMAIN)
+                || domain.equals(CHATGPT_LEGACY_BASE_DOMAIN) || domain.endsWith("." + CHATGPT_LEGACY_BASE_DOMAIN);
+    }
+
+    private static boolean isOpenAiAuthDomain(String domain) {
+        return domain.equals(OPENAI_AUTH_DOMAIN) || domain.endsWith("." + OPENAI_AUTH_DOMAIN);
     }
 
     // OCI blob URL pattern: /v2/<name>/blobs/sha256:<64-hex-chars>
@@ -161,6 +184,9 @@ public class MitmProxy {
     private final String oauthToken;
     private final String ghToken;
     private final String bobApiKey;
+    private final String openaiApiKey;
+    private final boolean codexOauth;
+    private final CodexTokenStore codexTokenStore;
 
     // Vertex AI configuration. When useVertex=true, the proxy transparently translates
     // standard Anthropic API requests (to api.anthropic.com) into Vertex AI rawPredict
@@ -203,7 +229,8 @@ public class MitmProxy {
     public MitmProxy(Vertx vertx, String bindAddress, int mitmPort, int healthPort,
                      String healthBindAddress, String anthropicApiKey, String oauthToken,
                      String ghToken, String bobApiKey,
-                     boolean useVertex, String vertexRegion, String vertexProjectId) {
+                     boolean useVertex, String vertexRegion, String vertexProjectId,
+                     String openaiApiKey, boolean codexOauth) {
         this.vertx = vertx;
         this.bindAddress = bindAddress;
         this.healthBindAddress = healthBindAddress;
@@ -213,6 +240,9 @@ public class MitmProxy {
         this.oauthToken = oauthToken != null ? oauthToken : "";
         this.ghToken = ghToken;
         this.bobApiKey = bobApiKey != null ? bobApiKey : "";
+        this.openaiApiKey = openaiApiKey != null ? openaiApiKey : "";
+        this.codexOauth = codexOauth;
+        this.codexTokenStore = codexOauth ? new CodexTokenStore() : null;
         this.useVertex = useVertex;
         this.vertexRegion = vertexRegion != null ? vertexRegion : "";
         this.vertexProjectId = vertexProjectId != null ? vertexProjectId : "";
@@ -248,6 +278,7 @@ public class MitmProxy {
         var config = SpawnConfig.load();
         var gatewayIp = resolveGatewayIp(incus);
         var claude = config.getClaude();
+        var codex = config.getCodex();
         return new MitmProxy(
                 vertx,
                 gatewayIp,
@@ -260,7 +291,9 @@ public class MitmProxy {
                 config.getBob().getApiKey(),
                 claude.isUseVertex(),
                 claude.getCloudMlRegion(),
-                claude.getVertexProjectId());
+                claude.getVertexProjectId(),
+                codex.getApiKey(),
+                codex.isOauthMode());
     }
 
     /** Resolve the Incus bridge gateway IP (e.g. "10.166.11.1").
@@ -661,6 +694,12 @@ public class MitmProxy {
         var requestOptions = new RequestOptions()
                 .setMethod(clientReq.method())
                 .setPort(443);
+
+        if (isOpenAiAuthDomain(domain) && codexOauth && codexTokenStore != null && path != null
+                && (path.equals("/oauth/token") || path.equals("/oauth/revoke"))) {
+            handleCodexAuthRequest(clientReq, domain, bodyBytes, path);
+            return;
+        }
 
         if (useVertex && ANTHROPIC_DOMAINS.contains(domain) && path != null) {
             if (path.startsWith("/v1/projects/")) {
@@ -1385,6 +1424,27 @@ public class MitmProxy {
             if (!bobApiKey.isBlank()) {
                 upReq.putHeader("Authorization", "Apikey " + bobApiKey);
             }
+        } else if (OPENAI_API_DOMAINS.contains(domain)) {
+            if (!openaiApiKey.isBlank()) {
+                upReq.putHeader("Authorization", "Bearer " + openaiApiKey);
+            }
+        } else if (isCodexChatGptDomain(domain) && codexOauth && codexTokenStore != null) {
+            var tokens = codexTokenStore.get();
+            if (tokens != null && tokens.hasTokens()) {
+                upReq.putHeader("Authorization", "Bearer " + tokens.getAccessToken());
+                upReq.putHeader("ChatGPT-Account-ID", tokens.getAccountId());
+                upReq.putHeader("ChatGPT-Account-Id", tokens.getAccountId());
+                if (tokens.isFedramp()) {
+                    upReq.putHeader("X-OpenAI-Fedramp", "true");
+                }
+            }
+        } else if (isOpenAiAuthDomain(domain) && codexOauth && codexTokenStore != null) {
+            // Auth endpoint header injection — the real credential swap happens
+            // in handleCodexAuthRequest via request/response body rewriting
+            var tokens = codexTokenStore.get();
+            if (tokens != null && tokens.hasTokens()) {
+                upReq.putHeader("Authorization", "Bearer " + tokens.getAccessToken());
+            }
         }
         return true;
     }
@@ -1630,6 +1690,231 @@ public class MitmProxy {
         upResp.endHandler(v -> clientResp.end());
         upResp.exceptionHandler(err ->
                 System.err.println("Relay stream error: " + err.getMessage()));
+    }
+
+    // --- Codex OAuth body rewriting ---
+
+    private static final long CODEX_REFRESH_COALESCE_MS = 30_000;
+
+    private void handleCodexAuthRequest(HttpServerRequest clientReq, String domain,
+                                         byte[] bodyBytes, String path) {
+        try {
+            if (path.equals("/oauth/revoke")) {
+                handleCodexRevoke(clientReq, domain, bodyBytes);
+                return;
+            }
+            // /oauth/token
+            var bodyStr = new String(bodyBytes, java.nio.charset.StandardCharsets.UTF_8);
+            var bodyJson = JSON.readTree(bodyStr);
+
+            var grantType = bodyJson.has("grant_type") ? bodyJson.get("grant_type").asText() : "";
+            if ("refresh_token".equals(grantType)) {
+                handleCodexRefresh(clientReq, domain, bodyJson);
+            } else {
+                // authorization_code (initial login) or other grant types — pass through,
+                // but capture tokens from the response
+                forwardCodexAuthAndCapture(clientReq, domain, bodyBytes, false);
+            }
+        } catch (Exception e) {
+            System.err.println("Codex auth request error: " + e.getMessage());
+            e.printStackTrace(System.err);
+            sendError(clientReq.response(), 502, "Proxy error");
+        }
+    }
+
+    private void handleCodexRevoke(HttpServerRequest clientReq, String domain,
+                                    byte[] bodyBytes) throws Exception {
+        var bodyStr = new String(bodyBytes, java.nio.charset.StandardCharsets.UTF_8);
+        var bodyJson = (ObjectNode) JSON.readTree(bodyStr);
+
+        if (bodyJson.has("token") && codexTokenStore.hasTokens()) {
+            var tokens = codexTokenStore.get();
+            bodyJson.put("token", tokens.getRefreshToken());
+        }
+
+        var rewritten = JSON.writeValueAsBytes(bodyJson);
+        var requestOptions = new RequestOptions()
+                .setMethod(clientReq.method())
+                .setPort(443)
+                .setHost(domain)
+                .setURI(clientReq.uri());
+        upstreamClient.request(requestOptions).onSuccess(upReq -> {
+            copyRequestHeaders(clientReq, upReq, domain);
+            upReq.putHeader("Host", domain);
+            upReq.putHeader("Content-Length", String.valueOf(rewritten.length));
+            upReq.send(Buffer.buffer(rewritten)).onSuccess(upResp -> {
+                var clientResp = clientReq.response();
+                clientResp.setStatusCode(upResp.statusCode());
+                clientResp.setStatusMessage(upResp.statusMessage());
+                copyResponseHeaders(upResp, clientResp);
+                pipeResponse(upResp, clientResp);
+            }).onFailure(err -> {
+                System.err.println("Codex revoke upstream error: " + err.getMessage());
+                sendError(clientReq.response(), 502, "Upstream error");
+            });
+        }).onFailure(err -> {
+            System.err.println("Codex revoke connect error: " + err.getMessage());
+            sendError(clientReq.response(), 502, "Upstream connection failed");
+        });
+    }
+
+    private synchronized void handleCodexRefresh(HttpServerRequest clientReq, String domain,
+                                                   com.fasterxml.jackson.databind.JsonNode bodyJson) {
+        if (codexTokenStore.recentlyRefreshed(CODEX_REFRESH_COALESCE_MS) && codexTokenStore.hasTokens()) {
+            sendSyntheticRefreshResponse(clientReq);
+            return;
+        }
+
+        try {
+            var rewrittenBody = (ObjectNode) bodyJson.deepCopy();
+            var tokens = codexTokenStore.get();
+            if (tokens != null && !tokens.getRefreshToken().isBlank()) {
+                rewrittenBody.put("refresh_token", tokens.getRefreshToken());
+            }
+            var rewritten = JSON.writeValueAsBytes(rewrittenBody);
+            forwardCodexAuthAndCapture(clientReq, domain, rewritten, true);
+        } catch (Exception e) {
+            System.err.println("Codex refresh rewrite error: " + e.getMessage());
+            sendError(clientReq.response(), 502, "Proxy error");
+        }
+    }
+
+    private void sendSyntheticRefreshResponse(HttpServerRequest clientReq) {
+        try {
+            var tokens = codexTokenStore.get();
+            var responseNode = JSON.createObjectNode();
+            responseNode.put("access_token", CodexSetup.mintAccessTokenWithExp(extractExpFromJwt(tokens.getAccessToken())));
+            responseNode.put("refresh_token", CodexSetup.PLACEHOLDER_REFRESH_TOKEN);
+            responseNode.put("id_token", placeholderIdToken());
+            responseNode.put("token_type", "Bearer");
+            responseNode.put("expires_in", 3600);
+            var body = JSON.writeValueAsBytes(responseNode);
+            var resp = clientReq.response();
+            resp.setStatusCode(200);
+            resp.putHeader("Content-Type", "application/json");
+            resp.putHeader("Content-Length", String.valueOf(body.length));
+            resp.end(Buffer.buffer(body));
+        } catch (Exception e) {
+            System.err.println("Codex synthetic refresh error: " + e.getMessage());
+            sendError(clientReq.response(), 502, "Proxy error");
+        }
+    }
+
+    private void forwardCodexAuthAndCapture(HttpServerRequest clientReq, String domain,
+                                             byte[] bodyBytes, boolean isRefresh) {
+        var requestOptions = new RequestOptions()
+                .setMethod(clientReq.method())
+                .setPort(443)
+                .setHost(domain)
+                .setURI(clientReq.uri());
+        upstreamClient.request(requestOptions).onSuccess(upReq -> {
+            copyRequestHeaders(clientReq, upReq, domain);
+            upReq.putHeader("Host", domain);
+            upReq.putHeader("Content-Length", String.valueOf(bodyBytes.length));
+            upReq.send(Buffer.buffer(bodyBytes)).onSuccess(upResp -> {
+                upResp.body().onSuccess(respBody -> {
+                    try {
+                        captureAndRewriteCodexTokenResponse(clientReq, upResp, respBody.getBytes());
+                    } catch (Exception e) {
+                        System.err.println("Codex token capture error: " + e.getMessage());
+                        sendError(clientReq.response(), 502, "Proxy error");
+                    }
+                }).onFailure(err -> {
+                    System.err.println("Codex auth response body error: " + err.getMessage());
+                    sendError(clientReq.response(), 502, "Upstream error");
+                });
+            }).onFailure(err -> {
+                System.err.println("Codex auth upstream error: " + err.getMessage());
+                sendError(clientReq.response(), 502, "Upstream error");
+            });
+        }).onFailure(err -> {
+            System.err.println("Codex auth connect error: " + err.getMessage());
+            sendError(clientReq.response(), 502, "Upstream connection failed");
+        });
+    }
+
+    private void captureAndRewriteCodexTokenResponse(HttpServerRequest clientReq,
+                                                      HttpClientResponse upResp,
+                                                      byte[] respBytes) throws Exception {
+        var clientResp = clientReq.response();
+        clientResp.setStatusCode(upResp.statusCode());
+        clientResp.setStatusMessage(upResp.statusMessage());
+        copyResponseHeaders(upResp, clientResp);
+
+        if (upResp.statusCode() != 200) {
+            clientResp.putHeader("Content-Length", String.valueOf(respBytes.length));
+            clientResp.end(Buffer.buffer(respBytes));
+            return;
+        }
+
+        var respJson = (ObjectNode) JSON.readTree(respBytes);
+        var storedTokens = codexTokenStore.get();
+        if (storedTokens == null) storedTokens = new CodexTokenStore.Tokens();
+
+        if (respJson.has("access_token")) {
+            storedTokens.setAccessToken(respJson.get("access_token").asText());
+        }
+        if (respJson.has("refresh_token")) {
+            storedTokens.setRefreshToken(respJson.get("refresh_token").asText());
+        }
+        if (respJson.has("id_token")) {
+            storedTokens.setIdToken(respJson.get("id_token").asText());
+        }
+
+        var idTokenStr = respJson.has("id_token") ? respJson.get("id_token").asText() : "";
+        if (!idTokenStr.isBlank()) {
+            extractAccountInfo(idTokenStr, storedTokens);
+        }
+
+        codexTokenStore.save(storedTokens);
+        ProxyLog.info("Captured Codex OAuth tokens (account: " + storedTokens.getAccountId() + ")");
+
+        long realExp = extractExpFromJwt(storedTokens.getAccessToken());
+        respJson.put("access_token", CodexSetup.mintAccessTokenWithExp(realExp));
+        respJson.put("refresh_token", CodexSetup.PLACEHOLDER_REFRESH_TOKEN);
+        respJson.put("id_token", placeholderIdToken());
+
+        var rewrittenResp = JSON.writeValueAsBytes(respJson);
+        clientResp.putHeader("Content-Length", String.valueOf(rewrittenResp.length));
+        clientResp.end(Buffer.buffer(rewrittenResp));
+    }
+
+    private static String placeholderIdToken() {
+        return CodexSetup.mintPlaceholderIdToken();
+    }
+
+    static long extractExpFromJwt(String jwt) {
+        if (jwt == null || jwt.isBlank()) return System.currentTimeMillis() / 1000 + 3600;
+        try {
+            var parts = jwt.split("\\.");
+            if (parts.length < 2) return System.currentTimeMillis() / 1000 + 3600;
+            var payloadJson = new String(Base64.getUrlDecoder().decode(parts[1]),
+                    java.nio.charset.StandardCharsets.UTF_8);
+            var payload = JSON.readTree(payloadJson);
+            if (payload.has("exp")) {
+                return payload.get("exp").asLong();
+            }
+        } catch (Exception ignored) {}
+        return System.currentTimeMillis() / 1000 + 3600;
+    }
+
+    private static void extractAccountInfo(String idToken, CodexTokenStore.Tokens tokens) {
+        try {
+            var parts = idToken.split("\\.");
+            if (parts.length < 2) return;
+            var payloadJson = new String(Base64.getUrlDecoder().decode(parts[1]),
+                    java.nio.charset.StandardCharsets.UTF_8);
+            var payload = JSON.readTree(payloadJson);
+            var authClaim = payload.get("https://api.openai.com/auth");
+            if (authClaim != null) {
+                if (authClaim.has("chatgpt_account_id")) {
+                    tokens.setAccountId(authClaim.get("chatgpt_account_id").asText());
+                }
+                if (authClaim.has("chatgpt_account_is_fedramp")) {
+                    tokens.setFedramp(authClaim.get("chatgpt_account_is_fedramp").asBoolean());
+                }
+            }
+        } catch (Exception ignored) {}
     }
 
     private void sendError(HttpServerResponse resp, int statusCode, String message) {

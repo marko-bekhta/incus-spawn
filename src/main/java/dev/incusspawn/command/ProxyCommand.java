@@ -82,6 +82,9 @@ public class ProxyCommand extends BaseCommand {
             var oauthToken = claude.getOauthToken();
             var ghToken = config.getGithub().getToken();
             var bobApiKey = config.getBob().getApiKey();
+            var codex = config.getCodex();
+            var openaiApiKey = codex.getApiKey();
+            var codexOauth = codex.isOauthMode();
 
             if (claude.isUseVertex()) {
                 if (claude.getCloudMlRegion().isBlank() || claude.getVertexProjectId().isBlank()) {
@@ -135,6 +138,11 @@ public class ProxyCommand extends BaseCommand {
             }
             System.out.println("  GitHub token:  " + (ghToken.isBlank() ? "(not configured)" : "configured"));
             System.out.println("  Bob API key:   " + (bobApiKey.isBlank() ? "(not configured)" : "configured"));
+            if (codexOauth) {
+                System.out.println("  Codex:         OAuth mode");
+            } else if (!openaiApiKey.isBlank()) {
+                System.out.println("  Codex:         API key configured");
+            }
             System.out.println("  Log file:      " + logFile());
             System.out.println();
 
@@ -142,7 +150,8 @@ public class ProxyCommand extends BaseCommand {
             var vertx = Arc.container().instance(Vertx.class).get();
             var proxy = new MitmProxy(vertx, gatewayIp, port, healthPort, healthBindAddress,
                     apiKey, oauthToken, ghToken, bobApiKey,
-                    claude.isUseVertex(), claude.getCloudMlRegion(), claude.getVertexProjectId());
+                    claude.isUseVertex(), claude.getCloudMlRegion(), claude.getVertexProjectId(),
+                    openaiApiKey, codexOauth);
 
             if (debug) {
                 try {
